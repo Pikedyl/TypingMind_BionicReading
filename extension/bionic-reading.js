@@ -79,7 +79,13 @@
 
     // Performance: Pre-compile regex patterns
     const REGEX = {
-        URL: /^(https?:\/\/|www\.)/i,
+        URL: /^(https?:\/\/|www\.|mailto:|tel:)/i,
+        FILE_EXT: /\.\w{1,5}$/, // Filenames like .js, .json
+        NUMERIC: /^\d+([.,]\d+)*%?$/, // Numbers, decimals, percentages
+        DATE: /^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}$/, // Dates 2023-01-01
+        TIME: /^\d{1,2}:\d{2}(:\d{2})?(am|pm)?$/i, // Times 12:00
+        VERSION: /^v?\d+(\.\d+)+$/, // Version numbers v1.0.2
+        UUID: /^[0-9a-f]{8}-[0-9a-f]{4}/i, // UUIDs/Hashes
         WHITESPACE: /^\s+$/,
         WORD_PARTS: /^([^\p{L}\p{N}]*)([\p{L}\p{N}]+(?:[-'’][\p{L}\p{N}]+)*)([^\p{L}\p{N}]*)$/u,
         SPLIT_WHITESPACE: /(\s+)/,
@@ -108,8 +114,15 @@
         // 1. Skip empty or purely whitespace
         if (!word || !word.trim()) return word;
 
-        // 2. Skip URLs (use cached regex)
+        // 2. Skip robust technical patterns
         if (REGEX.URL.test(word)) return word;
+        if (REGEX.NUMERIC.test(word)) return word;
+        if (REGEX.DATE.test(word)) return word;
+        if (REGEX.TIME.test(word)) return word;
+        if (REGEX.VERSION.test(word)) return word;
+        if (REGEX.UUID.test(word)) return word;
+        // Skip filenames (heuristic: contains dot but not at end)
+        if (word.includes('.') && !word.endsWith('.') && REGEX.FILE_EXT.test(word)) return word;
 
         // 3. Separate punctuation from the actual word part (use cached regex)
         const match = word.match(REGEX.WORD_PARTS);
@@ -121,17 +134,23 @@
 
         const [_, prefix, core, suffix] = match;
 
-        // 4. Handle hyphenated words (e.g., "self-taught")
+        // 4. Skip if core is too short or numeric-like
+        if (core.length < 2 && !/[a-zA-Z]/.test(core)) return word;
+        
+        // 5. Handle hyphenated words (e.g., "self-taught")
         if (core.includes('-')) {
             const parts = core.split('-');
             const processedParts = parts.map(part => {
+                // Skip numeric parts in hyphenated words (e.g., "v1-beta")
+                if (/^\d+$/.test(part)) return part;
+                
                 const len = getBoldLength(part.length);
                 return `<b>${part.slice(0, len)}</b>${part.slice(len)}`;
             });
             return prefix + processedParts.join('-') + suffix;
         }
 
-        // 5. Normal processing
+        // 6. Normal processing
         const boldLen = getBoldLength(core.length);
         const boldedPart = `<b>${core.slice(0, boldLen)}</b>${core.slice(boldLen)}`;
         
