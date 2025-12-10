@@ -10,21 +10,51 @@
  * - Minimal UI: Toggle with Ctrl+Shift+B (or Cmd+Shift+B on Mac)
  * - Visual feedback via toast notifications
  * - Safe handling of Unicode, URLs, and edge cases
+ * - Custom font support
  */
 
 (function() {
     'use strict';
 
+    // =========================================================================
+    // ⚙️ USER SETTINGS - Edit these values to customize the extension
+    // =========================================================================
+    const USER_SETTINGS = {
+        // FONT: Set your preferred font for AI responses
+        // Examples: "Segoe UI", "Arial", "Verdana", "Open Sans", "Roboto"
+        // Set to null to use TypingMind's default font
+        FONT_FAMILY: '"Segoe UI", system-ui, -apple-system, sans-serif',
+
+        // BOLD RATIO: How much of each word to bold (0.0 to 1.0)
+        // 0.43 (43%) is optimized for ADHD/Dyslexia based on EEG research
+        // Try 0.50 for more bold, or 0.33 for less
+        BOLD_RATIO: 0.43,
+
+        // START ENABLED: Should bionic reading be ON when you first load the page?
+        // true = starts enabled, false = starts disabled
+        ENABLED_BY_DEFAULT: true,
+
+        // PROCESSING DELAY: Milliseconds to wait before processing streaming text
+        // Lower = faster updates but more CPU usage. Default: 500
+        DEBOUNCE_MS: 500,
+    };
+    // =========================================================================
+    // END OF USER SETTINGS - Do not edit below unless you know what you're doing
+    // =========================================================================
+
     // -------------------------------------------------------------------------
-    // 1. CONFIGURATION & CONSTANTS
+    // 1. CONFIGURATION & CONSTANTS (Internal)
     // -------------------------------------------------------------------------
 
     const CONFIG = {
         // Storage key for persistence
         STORAGE_KEY: 'typingmind_bionic_reading_enabled',
         
-        // Algorithm settings based on EEG research for ADHD/Dyslexia
-        BOLD_RATIO: 0.43,
+        // Use user settings
+        BOLD_RATIO: USER_SETTINGS.BOLD_RATIO,
+        FONT_FAMILY: USER_SETTINGS.FONT_FAMILY,
+        DEBOUNCE_MS: USER_SETTINGS.DEBOUNCE_MS,
+        ENABLED_BY_DEFAULT: USER_SETTINGS.ENABLED_BY_DEFAULT,
         
         // DOM Selectors
         SELECTORS: {
@@ -36,15 +66,12 @@
         
         // Tags to strictly ignore during traversal
         IGNORE_TAGS: new Set(['PRE', 'CODE', 'SCRIPT', 'STYLE', 'TEXTAREA', 'INPUT', 'SVG', 'PATH', 'BUTTON']),
-        
-        // Debounce delay for processing (handling streaming responses)
-        DEBOUNCE_MS: 500,
     };
 
     // State management
-    // Default to true (enabled) if user hasn't set a preference yet
+    // Use user's default preference if no stored state exists
     const storedState = localStorage.getItem(CONFIG.STORAGE_KEY);
-    let isEnabled = storedState === null ? true : storedState === 'true';
+    let isEnabled = storedState === null ? CONFIG.ENABLED_BY_DEFAULT : storedState === 'true';
     
     let processingTimeout = null;
     let observer = null;
@@ -241,7 +268,12 @@
         try {
             const responseBlocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
             responseBlocks.forEach(block => {
-                // Only process if not already processed
+                // Apply custom font if configured
+                if (CONFIG.FONT_FAMILY) {
+                    block.style.fontFamily = CONFIG.FONT_FAMILY;
+                }
+                
+                // Only process bionic formatting if not already processed
                 if (block.dataset.bionicProcessed !== 'true') {
                     processBlock(block);
                 }
@@ -256,6 +288,28 @@
     function revertAllProcessing() {
         const responseBlocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
         responseBlocks.forEach(block => revertBlock(block));
+    }
+
+    /**
+     * Applies custom font to all response blocks.
+     */
+    function applyCustomFont() {
+        if (!CONFIG.FONT_FAMILY) return;
+        
+        const responseBlocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
+        responseBlocks.forEach(block => {
+            block.style.fontFamily = CONFIG.FONT_FAMILY;
+        });
+    }
+
+    /**
+     * Removes custom font from all response blocks.
+     */
+    function removeCustomFont() {
+        const responseBlocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
+        responseBlocks.forEach(block => {
+            block.style.fontFamily = '';
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -393,6 +447,7 @@
         } else {
             showToast('📖 Bionic Reading: OFF');
             revertAllProcessing();
+            removeCustomFont();
         }
     }
 
