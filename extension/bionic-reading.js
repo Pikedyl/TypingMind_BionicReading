@@ -42,7 +42,10 @@
     };
 
     // State management
-    let isEnabled = localStorage.getItem(CONFIG.STORAGE_KEY) === 'true';
+    // Default to true (enabled) if user hasn't set a preference yet
+    const storedState = localStorage.getItem(CONFIG.STORAGE_KEY);
+    let isEnabled = storedState === null ? true : storedState === 'true';
+    
     let processingTimeout = null;
     let observer = null;
     let isProcessing = false;
@@ -292,7 +295,49 @@
     }
 
     // -------------------------------------------------------------------------
-    // 5. UI & NOTIFICATIONS
+    // 5. CHAT COMMANDS (Mobile Support)
+    // -------------------------------------------------------------------------
+
+    function setupChatCommand() {
+        // We need to attach to the textarea. It might not exist immediately.
+        // We'll use a delegation approach or polling if needed, but delegation on body is safer for dynamic elements.
+        
+        document.body.addEventListener('keydown', (e) => {
+            // Only care about Enter key (without Shift)
+            if (e.key === 'Enter' && !e.shiftKey) {
+                const target = e.target;
+                
+                // Check if it's the chat input
+                if (target.tagName === 'TEXTAREA' && 
+                   (target.dataset.elementId === 'chat-input-textbox' || target.id === 'chat-input-textbox')) {
+                    
+                    const value = target.value.trim();
+                    
+                    // Check for magic command
+                    if (value.toLowerCase() === '/bionic') {
+                        // Prevent sending to AI
+                        e.preventDefault();
+                        e.stopPropagation();
+                        
+                        // Clear input
+                        target.value = '';
+                        
+                        // Trigger React/Framework change events so the UI knows it's empty
+                        // TypingMind uses React, so we need to hack the value setter if possible, 
+                        // or just simple clear might work if we trigger input event.
+                        const event = new Event('input', { bubbles: true });
+                        target.dispatchEvent(event);
+                        
+                        // Toggle feature
+                        toggleExtension();
+                    }
+                }
+            }
+        }, { capture: true }); // Capture phase to intercept before TypingMind handles it
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. UI & NOTIFICATIONS
     // -------------------------------------------------------------------------
 
     function showToast(message) {
@@ -365,14 +410,17 @@
 
         // 2. Setup MutationObserver
         setupObserver();
+        
+        // 3. Setup Chat Command (for Mobile)
+        setupChatCommand();
 
-        // 3. Initial Run (if enabled)
+        // 4. Initial Run (if enabled)
         if (isEnabled) {
             // Wait a moment for initial load
             setTimeout(runBionicProcessing, 1000);
         }
 
-        console.log('[Bionic Reading] Ready. Press Ctrl+Shift+B to toggle.');
+        console.log('[Bionic Reading] Ready. Use Ctrl+Shift+B or type "/bionic" to toggle.');
     }
 
     // Start
