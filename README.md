@@ -2,7 +2,7 @@
 
 A lightweight, neurodivergent-optimized extension for TypingMind that applies Bionic Reading formatting to AI responses. This extension is designed to improve reading speed and comprehension for users with ADHD or Dyslexia by highlighting the initial letters of words (fixation points).
 
-**✨ V3.0 - Now with major performance & memory optimizations!**
+**✨ V3.1 - Now with Enhanced Stability & Crash Protection!**
 
 ## Features
 
@@ -14,7 +14,7 @@ A lightweight, neurodivergent-optimized extension for TypingMind that applies Bi
 - **Easy Toggle**: Turn on/off with keyboard shortcut or chat command
 - **⚡ High Performance**: Optimized for minimal memory usage and CPU impact
 - **🎯 Smart Processing**: Only processes visible content with Intersection Observer
-- **🛡️ Memory Safe**: Automatic cleanup prevents memory leaks
+- **🛡️ Crash Protection**: Intelligently skips streaming text to prevent UI artifacts
 
 ---
 
@@ -79,6 +79,9 @@ const USER_SETTINGS = {
     // BATCH SIZE: Maximum nodes to process per frame (prevents freezing)
     // Lower = more responsive UI, Higher = faster processing. Default: 50
     MAX_BATCH_SIZE: 50,
+    
+    // DEBUG: Enable console logging for troubleshooting
+    DEBUG_MODE: false,
 };
 ```
 
@@ -90,6 +93,7 @@ const USER_SETTINGS = {
 | `BOLD_RATIO` | How much of each word to bold | `0.33` (less), `0.43` (default), `0.50` (more) |
 | `ENABLED_BY_DEFAULT` | Start with bionic reading on or off | `true` or `false` |
 | `MAX_BATCH_SIZE` | Nodes to process per frame | `25` (more responsive), `50` (default), `100` (faster) |
+| `DEBUG_MODE` | Enable detailed logs in console | `true` (on), `false` (off) |
 
 ### Step 3: Host Your Custom Version
 

@@ -1,5 +1,5 @@
 /**
- * Bionic Reading for TypingMind - V3.0 OPTIMIZED
+ * Bionic Reading for TypingMind - V3.1 STABLE
  * 
  * An extension that applies Bionic Reading formatting to AI responses in TypingMind.
  * Optimized for neurodivergent readers (ADHD/Dyslexia) using a 43% fixation point algorithm.
@@ -8,51 +8,40 @@
  * - Neurodivergent-optimized algorithm (43% fixation ratio)
  * - Preserves code blocks (```...```) and inline code (`...`)
  * - Minimal UI: Toggle with Ctrl+Shift+B (or Cmd+Shift+B on Mac)
- * - Visual feedback via toast notifications
  * - Safe handling of Unicode, URLs, and edge cases
  * - Custom font support
  * - Performance Optimized: Targeted observation, efficient batching, minimal regex
+ * - Stability Protection: Skips active streaming nodes to prevent UI crashes
  * 
- * V3.0 OPTIMIZATIONS:
- * - Targeted MutationObserver (only response blocks, not entire body)
- * - Intersection Observer for lazy processing
- * - Batch size limits to prevent queue overflow
- * - Optimized regex patterns with early returns
- * - Cached DOM queries
- * - Proper cleanup and memory management
+ * V3.1 CHANGES:
+ * - Added "Stable Node" detection to avoid processing actively streaming text
+ * - Added debounce to wait for text to settle before processing
+ * - Integrated lightweight debug logger (hidden by default)
+ * - Fixed potential conflict with React virtual DOM during updates
  */
 
 (function() {
     'use strict';
 
     // =========================================================================
-    // ⚙️ USER SETTINGS - Edit these values to customize the extension
+    // ⚙️ USER SETTINGS
     // =========================================================================
     const USER_SETTINGS = {
-        // FONT: Set your preferred font for AI responses
-        // Examples: "Segoe UI Light", "Segoe UI", "Arial", "Verdana", "Open Sans", "Roboto"
-        // Set to null to use TypingMind's default font
         FONT_FAMILY: '"Segoe UI Light", "Segoe UI", system-ui, -apple-system, sans-serif',
-
-        // BOLD RATIO: How much of each word to bold (0.0 to 1.0)
-        // 0.43 (43%) is optimized for ADHD/Dyslexia based on EEG research
-        // Try 0.50 for more bold, or 0.33 for less
         BOLD_RATIO: 0.43,
-
-        // START ENABLED: Should bionic reading be ON when you first load the page?
-        // true = starts enabled, false = starts disabled
         ENABLED_BY_DEFAULT: true,
-
-        // BATCH SIZE: Maximum nodes to process per frame (prevents freezing)
         MAX_BATCH_SIZE: 50,
+        
+        // STABILITY SETTINGS
+        STREAMING_DEBOUNCE_MS: 1000, // Wait 1s after last change to process active nodes
+        
+        // DEBUG SETTINGS
+        DEBUG_MODE: false, // Set to true to enable console logs
     };
-    // =========================================================================
-    // END OF USER SETTINGS - Do not edit below unless you know what you're doing
-    // =========================================================================
 
-    // -------------------------------------------------------------------------
-    // 1. CONFIGURATION & CONSTANTS (Internal)
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // 1. CONFIGURATION & LOGGER
+    // =========================================================================
 
     const CONFIG = {
         STORAGE_KEY: 'typingmind_bionic_reading_enabled',
@@ -60,73 +49,71 @@
         FONT_FAMILY: USER_SETTINGS.FONT_FAMILY,
         ENABLED_BY_DEFAULT: USER_SETTINGS.ENABLED_BY_DEFAULT,
         MAX_BATCH_SIZE: USER_SETTINGS.MAX_BATCH_SIZE,
+        STREAMING_DEBOUNCE_MS: USER_SETTINGS.STREAMING_DEBOUNCE_MS,
         
         SELECTORS: {
             RESPONSE_BLOCK: '[data-element-id="response-block"]',
             CODE_BLOCK: 'pre',
             INLINE_CODE: 'code',
+            CURSOR: '.cursor', // Common cursor class in streaming text
         },
         
-        // Consolidated ignore tags for faster checks
         IGNORE_TAGS: new Set(['PRE', 'CODE', 'SCRIPT', 'STYLE', 'TEXTAREA', 'INPUT', 'SVG', 'PATH', 'BUTTON', 'NOSCRIPT']),
+    };
+
+    // Logger
+    const logger = {
+        log: (msg, ...args) => USER_SETTINGS.DEBUG_MODE && console.log(`[Bionic] ${msg}`, ...args),
+        warn: (msg, ...args) => USER_SETTINGS.DEBUG_MODE && console.warn(`[Bionic] ${msg}`, ...args),
+        error: (msg, ...args) => console.error(`[Bionic] ${msg}`, ...args),
     };
 
     // State management
     const storedState = localStorage.getItem(CONFIG.STORAGE_KEY);
     let isEnabled = storedState === null ? CONFIG.ENABLED_BY_DEFAULT : storedState === 'true';
     
-    // Performance: Track processed nodes (auto garbage collected)
+    // Track processed nodes
     const processedNodes = new WeakSet();
     
-    // Micro-batch queue with size limit
+    // Processing Queue
     let pendingNodes = [];
     let rafScheduled = false;
     let observer = null;
     let intersectionObserver = null;
     let styleElement = null;
-    let responseBlockCache = new Set(); // Cache response blocks we're observing
+    let responseBlockCache = new Set();
+    
+    // Debounce map for active nodes
+    const nodeDebounceMap = new WeakMap();
 
-    // Performance: Pre-compile regex patterns (optimized order - most common first)
+    // Regex Patterns
     const REGEX = {
-        // Fast rejections first
         WHITESPACE: /^\s*$/,
         SINGLE_CHAR: /^.$/,
         NUMERIC: /^\d+([.,]\d+)*%?$/,
-        
-        // Technical patterns
         URL: /^(https?:\/\/|www\.|mailto:|tel:|ftp:)/i,
         VERSION: /^v?\d+\.\d+/i,
         UUID: /^[0-9a-f]{8}-/i,
         DATE: /^\d{1,4}[-/]\d{1,2}/,
         TIME: /^\d{1,2}:\d{2}/,
-        
-        // Word processing
         WORD_PARTS: /^([^\p{L}\p{N}]*)([\p{L}\p{N}]+(?:[-''][\p{L}\p{N}]+)*)([^\p{L}\p{N}]*)$/u,
     };
 
-    // -------------------------------------------------------------------------
-    // 2. BIONIC READING CORE ALGORITHM (OPTIMIZED)
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // 2. CORE ALGORITHM
+    // =========================================================================
 
-    /**
-     * Calculates how many characters to bold based on word length.
-     */
     function getBoldLength(wordLength) {
         if (wordLength <= 3) return 1;
         return Math.round(wordLength * CONFIG.BOLD_RATIO);
     }
 
-    /**
-     * Fast check if word should be skipped (optimized with early returns)
-     */
     function shouldSkipWord(word) {
-        // Most common cases first
         if (word.length < 2) return true;
         if (REGEX.WHITESPACE.test(word)) return true;
         if (REGEX.NUMERIC.test(word)) return true;
         
-        // Technical patterns
-        if (word.length > 4) { // Only check these for longer strings
+        if (word.length > 4) {
             if (REGEX.URL.test(word)) return true;
             if (REGEX.VERSION.test(word)) return true;
             if (REGEX.UUID.test(word)) return true;
@@ -137,20 +124,16 @@
             if (REGEX.DATE.test(word)) return true;
         }
         
-        // File extensions (only check if contains dot)
         if (word.includes('.') && word.length < 20) {
             const parts = word.split('.');
             if (parts.length === 2 && parts[1].length <= 5 && /^[a-z0-9]+$/i.test(parts[1])) {
-                return true; // Likely a filename
+                return true;
             }
         }
         
         return false;
     }
 
-    /**
-     * Applies bionic formatting to a single word (optimized).
-     */
     function processWord(word) {
         if (!word || shouldSkipWord(word)) return word;
 
@@ -160,7 +143,6 @@
         const [_, prefix, core, suffix] = match;
         if (!core || core.length < 2) return word;
         
-        // Handle hyphenated words
         if (core.includes('-')) {
             const parts = core.split('-');
             const processed = [];
@@ -178,21 +160,14 @@
             return prefix + processed.join('-') + suffix;
         }
 
-        // Normal processing
         const boldLen = getBoldLength(core.length);
         return `${prefix}<b>${core.slice(0, boldLen)}</b>${core.slice(boldLen)}${suffix}`;
     }
 
-    /**
-     * Transforms a text string into Bionic Reading HTML (optimized).
-     */
     function transformText(text) {
         if (!text || text.length < 3) return text;
-        
-        // Fast path: if no word characters, return as-is
         if (!/[\p{L}\p{N}]/u.test(text)) return text;
         
-        // Split by whitespace and process
         const words = text.split(/(\s+)/);
         let result = '';
         
@@ -204,13 +179,10 @@
         return result;
     }
 
-    // -------------------------------------------------------------------------
-    // 3. DOM MANIPULATION & PROCESSING (OPTIMIZED)
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // 3. STABILITY & PROCESSING
+    // =========================================================================
 
-    /**
-     * Fast check if node should be skipped (cached parent checks)
-     */
     function shouldSkipNode(node) {
         let current = node;
         let depth = 0;
@@ -222,21 +194,26 @@
                 continue;
             }
 
-            // Fast tag check
+            // Skip Ignored Tags
             if (CONFIG.IGNORE_TAGS.has(current.tagName)) return true;
             
-            // User data protection (only check if dataset exists)
+            // Skip User Input & Notes
             if (current.dataset) {
                 const elId = current.dataset.elementId;
                 if (elId === 'user-note' || elId === 'message-input') return true;
             }
             
-            // Check contenteditable
+            // Skip Editable Areas
             if (current.contentEditable === 'true') return true;
 
-            // Check for bionic wrapper
+            // Skip Already Processed
             if (current.className && current.className.includes('bionic-text-wrapper')) return true;
             
+            // CRITICAL: Skip Active Streaming Cursor
+            // If the node contains the typing cursor, it's unstable
+            if (current.querySelector && current.querySelector('.cursor')) return true;
+            if (current.classList && current.classList.contains('cursor')) return true;
+
             current = current.parentNode;
             depth++;
         }
@@ -244,10 +221,26 @@
     }
 
     /**
-     * Process a single text node immediately.
+     * Checks if a node is likely being streamed (last child of last element)
      */
+    function isStreamingNode(node) {
+        const parent = node.parentNode;
+        if (!parent) return false;
+        
+        // If it's the last child, it might be streaming
+        if (parent.lastChild === node) {
+            // Check if parent is part of a response block
+            const responseBlock = parent.closest(CONFIG.SELECTORS.RESPONSE_BLOCK);
+            if (responseBlock) {
+                // If it's the very last text node in the response block, assume streaming
+                // This is a heuristic: check if any subsequent siblings in the block are empty
+                return true; 
+            }
+        }
+        return false;
+    }
+
     function processTextNode(node) {
-        // Strict validation
         if (!node || !node.parentNode || processedNodes.has(node)) return;
         
         try {
@@ -259,29 +252,40 @@
             
             if (shouldSkipNode(node.parentNode)) return;
 
+            // STABILITY CHECK: If node seems to be streaming, debounce it
+            if (isStreamingNode(node)) {
+                const now = Date.now();
+                const lastSeen = nodeDebounceMap.get(node) || 0;
+                
+                if (now - lastSeen < CONFIG.STREAMING_DEBOUNCE_MS) {
+                    // Update timestamp and requeue for later
+                    nodeDebounceMap.set(node, now);
+                    // Don't add to processedNodes yet, allow it to be re-processed later
+                    return; 
+                }
+            }
+
             const bionicHtml = transformText(text);
 
-            // Only modify DOM if there's a change
             if (text !== bionicHtml && bionicHtml.includes('<b>')) {
                 const span = document.createElement('span');
                 span.className = 'bionic-text-wrapper';
                 span.innerHTML = bionicHtml;
                 
+                // Double check parent before replacement
                 if (node.parentNode) {
                     node.parentNode.replaceChild(span, node);
                     processedNodes.add(span);
+                    nodeDebounceMap.delete(node); // Cleanup
                 }
             } else {
                 processedNodes.add(node);
             }
         } catch (e) {
-            console.debug('[Bionic Reading] Error processing node:', e);
+            logger.error('Error processing node:', e);
         }
     }
 
-    /**
-     * FLUSH BATCH: Process pending nodes with size limit
-     */
     function processBatch() {
         rafScheduled = false;
         
@@ -290,28 +294,24 @@
             return;
         }
 
-        // Process up to MAX_BATCH_SIZE nodes per frame
         const batch = pendingNodes.splice(0, CONFIG.MAX_BATCH_SIZE);
         
         for (let i = 0; i < batch.length; i++) {
             processTextNode(batch[i]);
         }
 
-        // If there are still pending nodes, schedule another batch
+        // Re-schedule if nodes remain
         if (pendingNodes.length > 0) {
             rafScheduled = true;
             requestAnimationFrame(processBatch);
         }
     }
 
-    /**
-     * Queue a node for processing (with overflow protection)
-     */
     function queueNode(node) {
-        // Prevent queue overflow
         if (pendingNodes.length > 1000) {
-            console.warn('[Bionic Reading] Queue overflow, skipping nodes');
-            return;
+            // Safety valve: Drop oldest nodes if queue is too full
+            pendingNodes.splice(0, 100); 
+            logger.warn('Queue overflow, dropped 100 nodes');
         }
         
         pendingNodes.push(node);
@@ -322,9 +322,6 @@
         }
     }
 
-    /**
-     * Process text nodes in an element (optimized TreeWalker)
-     */
     function processElement(element) {
         if (!element || shouldSkipNode(element)) return;
         
@@ -333,7 +330,6 @@
             NodeFilter.SHOW_TEXT,
             {
                 acceptNode: function(node) {
-                    // Filter out empty/whitespace-only nodes during traversal
                     if (!node.nodeValue || REGEX.WHITESPACE.test(node.nodeValue)) {
                         return NodeFilter.FILTER_REJECT;
                     }
@@ -348,9 +344,9 @@
         }
     }
 
-    // -------------------------------------------------------------------------
-    // 4. STYLING & REVERT (OPTIMIZED)
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // 4. OBSERVERS & EVENTS
+    // =========================================================================
 
     function injectStyles() {
         if (styleElement) return;
@@ -390,23 +386,13 @@
         removeStyles();
     }
 
-    /**
-     * Initial scan of existing content (optimized)
-     */
     function processExistingContent() {
         const blocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
         blocks.forEach(block => processElement(block));
     }
 
-    // -------------------------------------------------------------------------
-    // 5. OBSERVER (OPTIMIZED - TARGETED OBSERVATION)
-    // -------------------------------------------------------------------------
-
-    /**
-     * Setup observer for a specific response block (not entire document!)
-     */
     function observeResponseBlock(block) {
-        if (responseBlockCache.has(block)) return; // Already observing
+        if (responseBlockCache.has(block)) return;
         responseBlockCache.add(block);
 
         const blockObserver = new MutationObserver((mutations) => {
@@ -424,25 +410,34 @@
                         }
                     }
                 }
+                // Handle text updates (streaming)
+                else if (mutation.type === 'characterData') {
+                    // When text updates, we debounce it
+                    const node = mutation.target;
+                    nodeDebounceMap.set(node, Date.now());
+                    
+                    // Re-queue it to check later if it's stable
+                    setTimeout(() => {
+                        if (Date.now() - (nodeDebounceMap.get(node) || 0) >= CONFIG.STREAMING_DEBOUNCE_MS) {
+                            queueNode(node);
+                        }
+                    }, CONFIG.STREAMING_DEBOUNCE_MS + 100);
+                }
             }
         });
 
         blockObserver.observe(block, {
             childList: true,
             subtree: true,
+            characterData: true // Needed to detect streaming updates
         });
 
-        // Store observer for cleanup
         block._bionicObserver = blockObserver;
     }
 
-    /**
-     * Setup global observer to detect new response blocks
-     */
     function setupGlobalObserver() {
         if (observer) observer.disconnect();
 
-        // Use Intersection Observer for existing blocks (lazy loading)
         intersectionObserver = new IntersectionObserver((entries) => {
             entries.forEach(entry => {
                 if (entry.isIntersecting && isEnabled) {
@@ -452,11 +447,9 @@
             });
         }, { rootMargin: '100px' });
 
-        // Observe existing blocks
         const existingBlocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
         existingBlocks.forEach(block => intersectionObserver.observe(block));
 
-        // Lightweight observer for NEW response blocks only
         observer = new MutationObserver((mutations) => {
             if (!isEnabled) return;
 
@@ -465,11 +458,9 @@
                     for (let i = 0; i < mutation.addedNodes.length; i++) {
                         const node = mutation.addedNodes[i];
                         if (node.nodeType === Node.ELEMENT_NODE) {
-                            // Check if it IS a response block
                             if (node.matches && node.matches(CONFIG.SELECTORS.RESPONSE_BLOCK)) {
                                 intersectionObserver.observe(node);
                             }
-                            // Or check if it CONTAINS response blocks
                             const blocks = node.querySelectorAll?.(CONFIG.SELECTORS.RESPONSE_BLOCK);
                             if (blocks) {
                                 blocks.forEach(block => intersectionObserver.observe(block));
@@ -480,16 +471,12 @@
             }
         });
 
-        // Only observe document body for NEW response blocks (much lighter)
         observer.observe(document.body, {
             childList: true,
             subtree: true,
         });
     }
 
-    /**
-     * Cleanup all observers
-     */
     function disconnectObservers() {
         if (observer) {
             observer.disconnect();
@@ -499,8 +486,6 @@
             intersectionObserver.disconnect();
             intersectionObserver = null;
         }
-        
-        // Disconnect individual block observers
         responseBlockCache.forEach(block => {
             if (block._bionicObserver) {
                 block._bionicObserver.disconnect();
@@ -510,10 +495,6 @@
         responseBlockCache.clear();
     }
 
-    // -------------------------------------------------------------------------
-    // 6. INITIALIZATION & EVENTS
-    // -------------------------------------------------------------------------
-
     function showToast(message) {
         const existing = document.getElementById('bionic-reading-toast');
         if (existing) existing.remove();
@@ -522,22 +503,14 @@
         toast.id = 'bionic-reading-toast';
         toast.textContent = message;
         toast.style.cssText = `
-            position: fixed;
-            bottom: 24px;
-            right: 24px;
-            background: #1f2937;
-            color: #f3f4f6;
-            padding: 12px 20px;
-            border-radius: 8px;
-            z-index: 99999;
+            position: fixed; bottom: 24px; right: 24px;
+            background: #1f2937; color: #f3f4f6; padding: 12px 20px;
+            border-radius: 8px; z-index: 99999;
             font-family: system-ui, -apple-system, sans-serif;
-            font-size: 14px;
-            font-weight: 500;
+            font-size: 14px; font-weight: 500;
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-            border: 1px solid #374151;
-            opacity: 0;
-            transform: translateY(10px);
-            transition: opacity 0.3s, transform 0.3s;
+            border: 1px solid #374151; opacity: 0;
+            transform: translateY(10px); transition: opacity 0.3s, transform 0.3s;
         `;
 
         document.body.appendChild(toast);
@@ -566,14 +539,13 @@
             showToast('📖 Bionic Reading: OFF');
             disconnectObservers();
             revertAllProcessing();
-            pendingNodes = []; // Clear pending queue
+            pendingNodes = [];
         }
     }
 
     function init() {
-        console.log('[Bionic Reading] Initializing v3.0 (Optimized for Memory & Performance)...');
+        logger.log('Initializing v3.1 Stable...');
 
-        // Keyboard Shortcut
         document.addEventListener('keydown', (e) => {
             if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'b' || e.key === 'B')) {
                 e.preventDefault();
@@ -581,7 +553,6 @@
             }
         });
 
-        // Mobile Chat Command
         document.body.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 const target = e.target;
@@ -597,17 +568,14 @@
             }
         }, { capture: true });
 
-        // Initial Run
         if (isEnabled) {
             injectStyles();
-            // Small delay to let page load
             setTimeout(() => {
                 setupGlobalObserver();
                 processExistingContent();
             }, 500);
         }
 
-        // Cleanup on page unload
         window.addEventListener('beforeunload', () => {
             disconnectObservers();
         });
