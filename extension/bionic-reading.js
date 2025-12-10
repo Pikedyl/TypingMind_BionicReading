@@ -1,5 +1,5 @@
 /**
- * Bionic Reading for TypingMind - V3.1 STABLE
+ * Bionic Reading for TypingMind - V3.2 EFFICIENCY POLISH
  * 
  * An extension that applies Bionic Reading formatting to AI responses in TypingMind.
  * Optimized for neurodivergent readers (ADHD/Dyslexia) using a 43% fixation point algorithm.
@@ -13,11 +13,11 @@
  * - Performance Optimized: Targeted observation, efficient batching, minimal regex
  * - Stability Protection: Skips active streaming nodes to prevent UI crashes
  * 
- * V3.1 CHANGES:
- * - Added "Stable Node" detection to avoid processing actively streaming text
- * - Added debounce to wait for text to settle before processing
- * - Integrated lightweight debug logger (hidden by default)
- * - Fixed potential conflict with React virtual DOM during updates
+ * V3.2 CHANGES:
+ * - Replaced per-character timeouts with a single efficiency polling loop for streaming text
+ * - Consolidated active node tracking to reduce memory churn
+ * - Fixed hardcoded selectors
+ * - Removed redundant debug file
  */
 
 (function() {
@@ -83,8 +83,10 @@
     let styleElement = null;
     let responseBlockCache = new Set();
     
-    // Debounce map for active nodes
-    const nodeDebounceMap = new WeakMap();
+    // Stability Checker State
+    const activeStreamingNodes = new Set(); // Nodes currently receiving updates
+    const nodeLastUpdateMap = new WeakMap(); // Last update timestamp for nodes
+    let stabilityCheckInterval = null;
 
     // Regex Patterns
     const REGEX = {
@@ -210,9 +212,8 @@
             if (current.className && current.className.includes('bionic-text-wrapper')) return true;
             
             // CRITICAL: Skip Active Streaming Cursor
-            // If the node contains the typing cursor, it's unstable
-            if (current.querySelector && current.querySelector('.cursor')) return true;
-            if (current.classList && current.classList.contains('cursor')) return true;
+            if (current.querySelector && current.querySelector(CONFIG.SELECTORS.CURSOR)) return true;
+            if (current.classList && current.classList.contains(CONFIG.SELECTORS.CURSOR.substring(1))) return true;
 
             current = current.parentNode;
             depth++;
@@ -233,11 +234,51 @@
             const responseBlock = parent.closest(CONFIG.SELECTORS.RESPONSE_BLOCK);
             if (responseBlock) {
                 // If it's the very last text node in the response block, assume streaming
-                // This is a heuristic: check if any subsequent siblings in the block are empty
                 return true; 
             }
         }
         return false;
+    }
+
+    /**
+     * Efficiently manage streaming node updates
+     */
+    function markNodeStreaming(node) {
+        const now = Date.now();
+        nodeLastUpdateMap.set(node, now);
+        activeStreamingNodes.add(node);
+        
+        // Start the check loop if not running
+        if (!stabilityCheckInterval) {
+            stabilityCheckInterval = setInterval(checkStability, 200); // Check every 200ms
+        }
+    }
+
+    /**
+     * Single loop to check all streaming nodes for stability
+     */
+    function checkStability() {
+        if (activeStreamingNodes.size === 0) {
+            clearInterval(stabilityCheckInterval);
+            stabilityCheckInterval = null;
+            return;
+        }
+
+        const now = Date.now();
+        
+        for (const node of activeStreamingNodes) {
+            const lastUpdate = nodeLastUpdateMap.get(node) || 0;
+            
+            // If node has been stable for long enough
+            if (now - lastUpdate >= CONFIG.STREAMING_DEBOUNCE_MS) {
+                // Remove from tracking
+                activeStreamingNodes.delete(node);
+                nodeLastUpdateMap.delete(node);
+                
+                // Queue for processing
+                queueNode(node);
+            }
+        }
     }
 
     function processTextNode(node) {
@@ -255,12 +296,10 @@
             // STABILITY CHECK: If node seems to be streaming, debounce it
             if (isStreamingNode(node)) {
                 const now = Date.now();
-                const lastSeen = nodeDebounceMap.get(node) || 0;
+                const lastSeen = nodeLastUpdateMap.get(node) || 0;
                 
                 if (now - lastSeen < CONFIG.STREAMING_DEBOUNCE_MS) {
-                    // Update timestamp and requeue for later
-                    nodeDebounceMap.set(node, now);
-                    // Don't add to processedNodes yet, allow it to be re-processed later
+                    markNodeStreaming(node);
                     return; 
                 }
             }
@@ -276,7 +315,8 @@
                 if (node.parentNode) {
                     node.parentNode.replaceChild(span, node);
                     processedNodes.add(span);
-                    nodeDebounceMap.delete(node); // Cleanup
+                    // Cleanup from tracking if it was there
+                    activeStreamingNodes.delete(node);
                 }
             } else {
                 processedNodes.add(node);
@@ -412,16 +452,8 @@
                 }
                 // Handle text updates (streaming)
                 else if (mutation.type === 'characterData') {
-                    // When text updates, we debounce it
-                    const node = mutation.target;
-                    nodeDebounceMap.set(node, Date.now());
-                    
-                    // Re-queue it to check later if it's stable
-                    setTimeout(() => {
-                        if (Date.now() - (nodeDebounceMap.get(node) || 0) >= CONFIG.STREAMING_DEBOUNCE_MS) {
-                            queueNode(node);
-                        }
-                    }, CONFIG.STREAMING_DEBOUNCE_MS + 100);
+                    // Update timestamp for this node
+                    markNodeStreaming(mutation.target);
                 }
             }
         });
@@ -486,6 +518,12 @@
             intersectionObserver.disconnect();
             intersectionObserver = null;
         }
+        if (stabilityCheckInterval) {
+            clearInterval(stabilityCheckInterval);
+            stabilityCheckInterval = null;
+        }
+        activeStreamingNodes.clear();
+        
         responseBlockCache.forEach(block => {
             if (block._bionicObserver) {
                 block._bionicObserver.disconnect();
@@ -503,14 +541,22 @@
         toast.id = 'bionic-reading-toast';
         toast.textContent = message;
         toast.style.cssText = `
-            position: fixed; bottom: 24px; right: 24px;
-            background: #1f2937; color: #f3f4f6; padding: 12px 20px;
-            border-radius: 8px; z-index: 99999;
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #1f2937;
+            color: #f3f4f6;
+            padding: 12px 20px;
+            border-radius: 8px;
+            z-index: 99999;
             font-family: system-ui, -apple-system, sans-serif;
-            font-size: 14px; font-weight: 500;
+            font-size: 14px;
+            font-weight: 500;
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-            border: 1px solid #374151; opacity: 0;
-            transform: translateY(10px); transition: opacity 0.3s, transform 0.3s;
+            border: 1px solid #374151;
+            opacity: 0;
+            transform: translateY(10px);
+            transition: opacity 0.3s, transform 0.3s;
         `;
 
         document.body.appendChild(toast);
@@ -539,12 +585,12 @@
             showToast('📖 Bionic Reading: OFF');
             disconnectObservers();
             revertAllProcessing();
-            pendingNodes = [];
+            pendingNodes = []; // Clear pending queue
         }
     }
 
     function init() {
-        logger.log('Initializing v3.1 Stable...');
+        logger.log('Initializing v3.2 Efficiency Polish...');
 
         document.addEventListener('keydown', (e) => {
             if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'b' || e.key === 'B')) {

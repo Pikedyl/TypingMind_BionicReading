@@ -1,17 +1,16 @@
 # Changelog
 
-## V3.1 - Stability & Crash Protection (December 2025)
+## V3.2 - Efficiency Polish (December 2025)
 
-### 🛡️ Critical Fixes
+### 🚀 Optimization
+- **Streaming Efficiency**: Replaced per-character timeout loop with a single centralized stability checker
+- **Memory Reduction**: Consolidated tracking of active streaming nodes to reduce object creation
+- **Code Cleanup**: Removed redundant debug files and fixed hardcoded selectors
+
+### 🛡️ Critical Fixes (from V3.1)
 - **Stable Node Detection**: Now detects and ignores active streaming text nodes to prevent React UI crashes
 - **Streaming Debounce**: Added 1000ms debounce for rapidly changing text to prevent "artifacting" during generation
 - **Conflict Prevention**: Improved checks to ensure we don't interfere with TypingMind's virtual DOM updates
-- **Queue Safety**: Added stricter overflow protection to drop old nodes if processing gets backed up
-
-### 🔧 Improvements
-- **Integrated Debugger**: Added lightweight logging infrastructure (hidden by default) for easier troubleshooting
-- **Heuristic Streaming Detection**: Smarter detection of which node is currently being typed by the AI
-- **Error Boundaries**: Enhanced try-catch blocks around all DOM manipulations to prevent page-wide crashes
 
 ---
 
