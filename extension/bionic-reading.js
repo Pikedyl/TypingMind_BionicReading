@@ -21,9 +21,9 @@
     // =========================================================================
     const USER_SETTINGS = {
         // FONT: Set your preferred font for AI responses
-        // Examples: "Segoe UI", "Arial", "Verdana", "Open Sans", "Roboto"
+        // Examples: "Segoe UI Light", "Segoe UI", "Arial", "Verdana", "Open Sans", "Roboto"
         // Set to null to use TypingMind's default font
-        FONT_FAMILY: '"Segoe UI", system-ui, -apple-system, sans-serif',
+        FONT_FAMILY: '"Segoe UI Light", "Segoe UI", system-ui, -apple-system, sans-serif',
 
         // BOLD RATIO: How much of each word to bold (0.0 to 1.0)
         // 0.43 (43%) is optimized for ADHD/Dyslexia based on EEG research
@@ -35,8 +35,8 @@
         ENABLED_BY_DEFAULT: true,
 
         // PROCESSING DELAY: Milliseconds to wait before processing streaming text
-        // Lower = faster updates but more CPU usage. Default: 500
-        DEBOUNCE_MS: 500,
+        // Lower = faster updates but more CPU usage. Default: 100
+        DEBOUNCE_MS: 100,
     };
     // =========================================================================
     // END OF USER SETTINGS - Do not edit below unless you know what you're doing
@@ -316,28 +316,54 @@
     // 4. EVENT LISTENERS & OBSERVERS
     // -------------------------------------------------------------------------
 
+    // Track pending blocks for batch processing
+    let pendingBlocks = new Set();
+
     function setupObserver() {
         if (observer) observer.disconnect();
 
         observer = new MutationObserver((mutations) => {
-            if (!isEnabled) return;
-
-            let shouldProcess = false;
-            for (const mutation of mutations) {
-                if (mutation.addedNodes.length > 0) {
-                    shouldProcess = true;
-                    break;
-                }
-                // Also watch for characterData changes if streaming updates existing text nodes
-                if (mutation.type === 'characterData') {
-                    shouldProcess = true;
-                    break;
-                }
+            if (!isEnabled) {
+                // Clear any pending blocks when disabled to prevent memory leaks
+                pendingBlocks.clear();
+                return;
             }
 
-            if (shouldProcess) {
+            // Collect only affected response blocks from mutations
+            for (const mutation of mutations) {
+                // Find the response block ancestor for the mutation target
+                let target = mutation.target;
+                while (target && target !== document.body) {
+                    if (target.matches && target.matches(CONFIG.SELECTORS.RESPONSE_BLOCK)) {
+                        // Only add if not already fully processed
+                        // For streaming, we need to re-process blocks that have new content
+                        pendingBlocks.add(target);
+                        break;
+                    }
+                    target = target.parentNode;
+                }
+
+                // Also check added nodes for new response blocks
+                mutation.addedNodes.forEach(node => {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        if (node.matches && node.matches(CONFIG.SELECTORS.RESPONSE_BLOCK)) {
+                            pendingBlocks.add(node);
+                        } else if (node.querySelectorAll) {
+                            node.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK).forEach(b => pendingBlocks.add(b));
+                        }
+                    }
+                });
+            }
+
+            if (pendingBlocks.size > 0) {
                 clearTimeout(processingTimeout);
-                processingTimeout = setTimeout(runBionicProcessing, CONFIG.DEBOUNCE_MS);
+                
+                // If too many blocks pending, process immediately to prevent memory buildup
+                if (pendingBlocks.size > 20) {
+                    processPendingBlocks();
+                } else {
+                    processingTimeout = setTimeout(processPendingBlocks, CONFIG.DEBOUNCE_MS);
+                }
             }
         });
 
@@ -346,6 +372,89 @@
             subtree: true,
             characterData: true
         });
+    }
+
+    /**
+     * Process only the blocks that have pending changes.
+     * More efficient than querying all blocks on every mutation.
+     */
+    function processPendingBlocks() {
+        if (!isEnabled || isProcessing) return;
+        isProcessing = true;
+
+        try {
+            pendingBlocks.forEach(block => {
+                // Verify block is still in DOM
+                if (!document.contains(block)) {
+                    pendingBlocks.delete(block);
+                    return;
+                }
+
+                // Apply custom font if configured
+                if (CONFIG.FONT_FAMILY) {
+                    block.style.fontFamily = CONFIG.FONT_FAMILY;
+                }
+
+                // For streaming content, we need to process new text nodes
+                // even if block was previously processed
+                processBlockIncremental(block);
+            });
+            pendingBlocks.clear();
+        } catch (e) {
+            console.error('[Bionic Reading] Error processing pending blocks:', e);
+        } finally {
+            isProcessing = false;
+        }
+    }
+
+    /**
+     * Incrementally process a block - only processes unprocessed text nodes.
+     * This allows re-processing streaming blocks without re-doing everything.
+     */
+    function processBlockIncremental(block) {
+        // Create TreeWalker to find all text nodes
+        const walker = document.createTreeWalker(
+            block,
+            NodeFilter.SHOW_TEXT,
+            {
+                acceptNode: function(node) {
+                    // Skip empty text nodes
+                    if (!node.nodeValue.trim()) return NodeFilter.FILTER_SKIP;
+                    // Skip if inside code block
+                    if (shouldSkipNode(node.parentNode)) return NodeFilter.FILTER_REJECT;
+                    // Skip if already inside our wrapper
+                    if (node.parentNode.classList && node.parentNode.classList.contains('bionic-text-wrapper')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            }
+        );
+
+        const textNodes = [];
+        let currentNode;
+        while (currentNode = walker.nextNode()) {
+            textNodes.push(currentNode);
+        }
+
+        // Process text nodes (TreeWalker already filtered, so minimal checks needed)
+        textNodes.forEach(node => {
+            const text = node.nodeValue;
+            const bionicHtml = transformText(text);
+
+            // Only touch DOM if transformation actually changed something
+            if (text !== bionicHtml) {
+                const span = document.createElement('span');
+                span.className = 'bionic-text-wrapper';
+                span.innerHTML = bionicHtml;
+                span.dataset.originalText = text;
+
+                node.parentNode.replaceChild(span, node);
+            }
+        });
+
+        // Mark as processed (for full revert tracking)
+        block.dataset.bionicProcessed = 'true';
     }
 
     // -------------------------------------------------------------------------
@@ -471,8 +580,8 @@
 
         // 4. Initial Run (if enabled)
         if (isEnabled) {
-            // Wait a moment for initial load
-            setTimeout(runBionicProcessing, 1000);
+            // Quick initial processing
+            setTimeout(runBionicProcessing, 100);
         }
 
         console.log('[Bionic Reading] Ready. Use Ctrl+Shift+B or type "/bionic" to toggle.');
