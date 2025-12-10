@@ -11,6 +11,7 @@
  * - Visual feedback via toast notifications
  * - Safe handling of Unicode, URLs, and edge cases
  * - Custom font support
+ * - Performance Optimized: Micro-batching, WeakSet tracking, CSS injection
  */
 
 (function() {
@@ -33,10 +34,6 @@
         // START ENABLED: Should bionic reading be ON when you first load the page?
         // true = starts enabled, false = starts disabled
         ENABLED_BY_DEFAULT: true,
-
-        // PROCESSING DELAY: Milliseconds to wait before processing streaming text
-        // Lower = faster updates but more CPU usage. Default: 100
-        DEBOUNCE_MS: 100,
     };
     // =========================================================================
     // END OF USER SETTINGS - Do not edit below unless you know what you're doing
@@ -53,7 +50,6 @@
         // Use user settings
         BOLD_RATIO: USER_SETTINGS.BOLD_RATIO,
         FONT_FAMILY: USER_SETTINGS.FONT_FAMILY,
-        DEBOUNCE_MS: USER_SETTINGS.DEBOUNCE_MS,
         ENABLED_BY_DEFAULT: USER_SETTINGS.ENABLED_BY_DEFAULT,
         
         // DOM Selectors
@@ -69,13 +65,25 @@
     };
 
     // State management
-    // Use user's default preference if no stored state exists
     const storedState = localStorage.getItem(CONFIG.STORAGE_KEY);
     let isEnabled = storedState === null ? CONFIG.ENABLED_BY_DEFAULT : storedState === 'true';
     
-    let processingTimeout = null;
+    // Performance: Track processed nodes (auto garbage collected)
+    const processedNodes = new WeakSet();
+    
+    // Micro-batch queue for immediate processing
+    let pendingNodes = [];
+    let rafScheduled = false;
     let observer = null;
-    let isProcessing = false;
+    let styleElement = null;
+
+    // Performance: Pre-compile regex patterns
+    const REGEX = {
+        URL: /^(https?:\/\/|www\.)/i,
+        WHITESPACE: /^\s+$/,
+        WORD_PARTS: /^([^\p{L}\p{N}]*)([\p{L}\p{N}]+(?:[-'’][\p{L}\p{N}]+)*)([^\p{L}\p{N}]*)$/u,
+        SPLIT_WHITESPACE: /(\s+)/,
+    };
 
     // -------------------------------------------------------------------------
     // 2. BIONIC READING CORE ALGORITHM
@@ -94,18 +102,17 @@
     /**
      * Applies bionic formatting to a single word.
      * Handles punctuation stripping and reattaching.
+     * Performance: Uses pre-compiled regex patterns.
      */
     function processWord(word) {
         // 1. Skip empty or purely whitespace
         if (!word || !word.trim()) return word;
 
-        // 2. Skip URLs
-        if (word.match(/^(https?:\/\/|www\.)/i)) return word;
+        // 2. Skip URLs (use cached regex)
+        if (REGEX.URL.test(word)) return word;
 
-        // 3. Separate punctuation from the actual word part
-        // Match leading punctuation, core word, trailing punctuation
-        // Unicode-aware regex for letters/numbers
-        const match = word.match(/^([^\p{L}\p{N}]*)([\p{L}\p{N}]+(?:[-'’][\p{L}\p{N}]+)*)([^\p{L}\p{N}]*)$/u);
+        // 3. Separate punctuation from the actual word part (use cached regex)
+        const match = word.match(REGEX.WORD_PARTS);
 
         if (!match) {
             // If strictly symbols (e.g. "->"), return as is
@@ -134,377 +141,256 @@
     /**
      * Transforms a text string into Bionic Reading HTML.
      * Preserves whitespace structure.
+     * Performance: Uses pre-compiled regex, early returns for short text.
      */
     function transformText(text) {
-        // Split by whitespace but keep the delimiters to preserve exact spacing
-        // This regex splits by space/newline but captures the separators
-        const parts = text.split(/(\s+)/);
+        // Performance: Skip very short or whitespace-only text
+        if (!text || text.length < 2) return text;
         
-        return parts.map(part => {
-            // If it's whitespace, return as is
-            if (part.match(/^\s+$/)) return part;
-            return processWord(part);
-        }).join('');
+        // Split by whitespace but keep the delimiters (use cached regex)
+        const parts = text.split(REGEX.SPLIT_WHITESPACE);
+        
+        // Performance: Use for loop instead of map for large arrays
+        const len = parts.length;
+        const result = new Array(len);
+        
+        for (let i = 0; i < len; i++) {
+            const part = parts[i];
+            // If it's whitespace, return as is (use cached regex)
+            result[i] = REGEX.WHITESPACE.test(part) ? part : processWord(part);
+        }
+        
+        return result.join('');
     }
 
     // -------------------------------------------------------------------------
-    // 3. DOM MANIPULATION
+    // 3. DOM MANIPULATION & PROCESSING
     // -------------------------------------------------------------------------
 
     /**
-     * Checks if an element or its ancestors are code blocks.
+     * Checks if an element or its ancestors are code blocks or user input areas.
      */
     function shouldSkipNode(node) {
         let current = node;
-        while (current && current !== document.body) {
-            if (current.tagName && CONFIG.IGNORE_TAGS.has(current.tagName)) {
+        // Limit traversal depth for performance
+        let depth = 0;
+        const maxDepth = 5;
+
+        while (current && current !== document.body && depth < maxDepth) {
+            // Safety: Skip invalid nodes
+            if (!current.tagName) {
+                current = current.parentNode;
+                depth++;
+                continue;
+            }
+
+            // Skip code blocks, scripts, styles, and form elements
+            if (CONFIG.IGNORE_TAGS.has(current.tagName)) {
                 return true;
             }
-            // Check for specific TypingMind code block classes if necessary
-            // Usually <pre> and <code> covers it
+            
+            // Skip user notes and inputs (Safety against interfering with user data)
+            if (current.dataset && (
+                current.dataset.elementId === 'user-note' || 
+                current.dataset.elementId === 'message-input' ||
+                current.getAttribute('contenteditable') === 'true'
+            )) {
+                return true;
+            }
+
+            // Check for bionic wrapper to prevent nested processing
+            if (current.classList && current.classList.contains('bionic-text-wrapper')) {
+                return true;
+            }
             current = current.parentNode;
+            depth++;
         }
         return false;
     }
 
     /**
-     * Processes a specific DOM element (Response Block).
+     * Process a single text node immediately.
      */
-    function processBlock(block) {
-        // Mark as processed to prevent infinite loops if we were observing attributes (we aren't, but good practice)
-        if (block.dataset.bionicProcessed === 'true') return;
-
-        // 1. Create TreeWalker to find all text nodes
-        const walker = document.createTreeWalker(
-            block,
-            NodeFilter.SHOW_TEXT,
-            {
-                acceptNode: function(node) {
-                    // Skip empty text nodes
-                    if (!node.nodeValue.trim()) return NodeFilter.FILTER_SKIP;
-                    // Skip if inside code block
-                    if (shouldSkipNode(node.parentNode)) return NodeFilter.FILTER_REJECT;
-                    return NodeFilter.FILTER_ACCEPT;
-                }
-            }
-        );
-
-        const textNodes = [];
-        let currentNode;
-        while (currentNode = walker.nextNode()) {
-            textNodes.push(currentNode);
-        }
-
-        // 2. Process text nodes
-        // We do this in a second pass to avoid messing up the walker while modifying the tree
-        textNodes.forEach(node => {
-            // Double check parent hasn't changed (unlikely but possible)
+    function processTextNode(node) {
+        // Strict Validation
+        if (!node || !node.parentNode) return;
+        if (processedNodes.has(node)) return;
+        
+        // Safety: catch access errors
+        try {
+            if (!node.nodeValue || !node.nodeValue.trim()) return;
             if (shouldSkipNode(node.parentNode)) return;
 
-            // Store original text for restoration
-            // We use a custom property on the parent element to store original structure if needed
-            // For simplicity in this v1, we just replace. Restoration will reload page or we can implement complex revert.
-            // To allow "Toggle Off", we should probably wrap our changes in a simplified way or just accept that "Off" requires page refresh/re-generation?
-            // "Revert" is hard with HTML injection. 
-            // Better approach for Toggle: 
-            // - If ON: Apply processing
-            // - If OFF: We might need to reload or re-render. 
-            // Let's implement a robust "Restore" by saving original text in a data attribute?
-            // No, that's too much memory.
-            // Let's settle for: Toggle ON applies it. Toggle OFF stops applying to NEW messages. 
-            // To clear existing, we'd ideally reload. But let's try to do it right:
-            // We wrap our changes in <span class="bionic-word">...</span>?
-            
-            // Simpler approach for V1:
-            // Just replace the text. If user toggles OFF, they might see mixed content until refresh.
-            // Wait, the plan said "Process/revert existing messages". 
-            // To revert, we need to strip the <b> tags we added.
-            
             const text = node.nodeValue;
             const bionicHtml = transformText(text);
-            
-            // Only touch DOM if transformation actually changed something
+
+            // Only modify DOM if there's a change
             if (text !== bionicHtml) {
                 const span = document.createElement('span');
                 span.className = 'bionic-text-wrapper';
                 span.innerHTML = bionicHtml;
-                span.dataset.originalText = text; // Save for revert
                 
-                node.parentNode.replaceChild(span, node);
-            }
-        });
-
-        block.dataset.bionicProcessed = 'true';
-    }
-
-    /**
-     * Reverts a block to its original state.
-     */
-    function revertBlock(block) {
-        // Find all our wrappers
-        const wrappers = block.querySelectorAll('.bionic-text-wrapper');
-        wrappers.forEach(span => {
-            const originalText = span.dataset.originalText;
-            if (originalText) {
-                const textNode = document.createTextNode(originalText);
-                span.parentNode.replaceChild(textNode, span);
+                // Safety: Verify parent still exists before replacement
+                if (node.parentNode) {
+                    node.parentNode.replaceChild(span, node);
+                    // Mark the new nodes as processed
+                    processedNodes.add(span);
+                }
             } else {
-                // Fallback: strip bold tags
-                const text = span.textContent;
-                const textNode = document.createTextNode(text);
-                span.parentNode.replaceChild(textNode, span);
+                // Mark as processed even if no change
+                processedNodes.add(node);
             }
-        });
-        delete block.dataset.bionicProcessed;
+        } catch (e) {
+            // Silent fail to prevent UI disruption
+            console.debug('[Bionic Reading] Skipped node due to error:', e);
+        }
     }
 
     /**
-     * Main processing function (Debounced).
+     * FLUSH BATCH: Process all pending nodes in one RAF frame
      */
-    function runBionicProcessing() {
-        if (!isEnabled || isProcessing) return;
-        isProcessing = true;
+    function processBatch() {
+        rafScheduled = false;
+        
+        if (!isEnabled || pendingNodes.length === 0) {
+            pendingNodes = [];
+            return;
+        }
 
-        try {
-            const responseBlocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
-            responseBlocks.forEach(block => {
-                // Apply custom font if configured
-                if (CONFIG.FONT_FAMILY) {
-                    block.style.fontFamily = CONFIG.FONT_FAMILY;
-                }
-                
-                // Only process bionic formatting if not already processed
-                if (block.dataset.bionicProcessed !== 'true') {
-                    processBlock(block);
-                }
-            });
-        } catch (e) {
-            console.error('[Bionic Reading] Error processing blocks:', e);
-        } finally {
-            isProcessing = false;
+        const batch = pendingNodes;
+        pendingNodes = []; // Clear queue immediately
+
+        // Process all nodes in this frame
+        for (let i = 0; i < batch.length; i++) {
+            processTextNode(batch[i]);
+        }
+    }
+
+    /**
+     * Queue a node for processing in next frame
+     */
+    function queueNode(node) {
+        pendingNodes.push(node);
+        
+        if (!rafScheduled) {
+            rafScheduled = true;
+            requestAnimationFrame(processBatch);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. STYLING & REVERT
+    // -------------------------------------------------------------------------
+
+    function injectStyles() {
+        if (styleElement) return;
+        if (!CONFIG.FONT_FAMILY) return;
+
+        styleElement = document.createElement('style');
+        styleElement.id = 'bionic-reading-styles';
+        styleElement.textContent = `
+            ${CONFIG.SELECTORS.RESPONSE_BLOCK} {
+                font-family: ${CONFIG.FONT_FAMILY} !important;
+            }
+            /* Ensure code blocks don't inherit the variable font */
+            ${CONFIG.SELECTORS.RESPONSE_BLOCK} pre, 
+            ${CONFIG.SELECTORS.RESPONSE_BLOCK} code {
+                font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
+            }
+        `;
+        document.head.appendChild(styleElement);
+    }
+
+    function removeStyles() {
+        if (styleElement) {
+            styleElement.remove();
+            styleElement = null;
         }
     }
 
     function revertAllProcessing() {
-        const responseBlocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
-        responseBlocks.forEach(block => revertBlock(block));
-    }
-
-    /**
-     * Applies custom font to all response blocks.
-     */
-    function applyCustomFont() {
-        if (!CONFIG.FONT_FAMILY) return;
+        const wrappers = document.querySelectorAll('.bionic-text-wrapper');
+        for (let i = 0; i < wrappers.length; i++) {
+            const span = wrappers[i];
+            const text = span.textContent;
+            const textNode = document.createTextNode(text);
+            span.parentNode.replaceChild(textNode, span);
+        }
         
-        const responseBlocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
-        responseBlocks.forEach(block => {
-            block.style.fontFamily = CONFIG.FONT_FAMILY;
-        });
+        // Also remove custom font
+        removeStyles();
     }
 
     /**
-     * Removes custom font from all response blocks.
+     * Initial scan of existing content
      */
-    function removeCustomFont() {
-        const responseBlocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
-        responseBlocks.forEach(block => {
-            block.style.fontFamily = '';
+    function processExistingContent() {
+        const blocks = document.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK);
+        blocks.forEach(block => {
+            const walker = document.createTreeWalker(
+                block,
+                NodeFilter.SHOW_TEXT,
+                null
+            );
+            
+            let node;
+            while (node = walker.nextNode()) {
+                queueNode(node);
+            }
         });
     }
 
     // -------------------------------------------------------------------------
-    // 4. EVENT LISTENERS & OBSERVERS
+    // 5. OBSERVER (Optimized)
     // -------------------------------------------------------------------------
-
-    // Track pending blocks for batch processing
-    let pendingBlocks = new Set();
 
     function setupObserver() {
         if (observer) observer.disconnect();
 
         observer = new MutationObserver((mutations) => {
-            if (!isEnabled) {
-                // Clear any pending blocks when disabled to prevent memory leaks
-                pendingBlocks.clear();
-                return;
-            }
+            if (!isEnabled) return;
 
-            // Collect only affected response blocks from mutations
             for (const mutation of mutations) {
-                // Find the response block ancestor for the mutation target
-                let target = mutation.target;
-                while (target && target !== document.body) {
-                    if (target.matches && target.matches(CONFIG.SELECTORS.RESPONSE_BLOCK)) {
-                        // Only add if not already fully processed
-                        // For streaming, we need to re-process blocks that have new content
-                        pendingBlocks.add(target);
-                        break;
-                    }
-                    target = target.parentNode;
-                }
-
-                // Also check added nodes for new response blocks
-                mutation.addedNodes.forEach(node => {
-                    if (node.nodeType === Node.ELEMENT_NODE) {
-                        if (node.matches && node.matches(CONFIG.SELECTORS.RESPONSE_BLOCK)) {
-                            pendingBlocks.add(node);
-                        } else if (node.querySelectorAll) {
-                            node.querySelectorAll(CONFIG.SELECTORS.RESPONSE_BLOCK).forEach(b => pendingBlocks.add(b));
+                // We only care about added nodes (childList)
+                if (mutation.type === 'childList') {
+                    for (let i = 0; i < mutation.addedNodes.length; i++) {
+                        const node = mutation.addedNodes[i];
+                        
+                        // If it's a text node, check if it's inside a response block
+                        if (node.nodeType === Node.TEXT_NODE) {
+                            if (node.parentElement && node.parentElement.closest(CONFIG.SELECTORS.RESPONSE_BLOCK)) {
+                                queueNode(node);
+                            }
+                        } 
+                        // If it's an element, look for text nodes inside
+                        else if (node.nodeType === Node.ELEMENT_NODE) {
+                            // Check if element is or is inside response block
+                            if (node.matches(CONFIG.SELECTORS.RESPONSE_BLOCK) || node.closest(CONFIG.SELECTORS.RESPONSE_BLOCK)) {
+                                const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+                                let textNode;
+                                while (textNode = walker.nextNode()) {
+                                    queueNode(textNode);
+                                }
+                            }
                         }
                     }
-                });
-            }
-
-            if (pendingBlocks.size > 0) {
-                clearTimeout(processingTimeout);
-                
-                // If too many blocks pending, process immediately to prevent memory buildup
-                if (pendingBlocks.size > 20) {
-                    processPendingBlocks();
-                } else {
-                    processingTimeout = setTimeout(processPendingBlocks, CONFIG.DEBOUNCE_MS);
                 }
             }
         });
 
+        // Observe document body for added nodes
         observer.observe(document.body, {
             childList: true,
             subtree: true,
-            characterData: true
+            characterData: false // Don't observe text changes, only insertions
         });
     }
 
-    /**
-     * Process only the blocks that have pending changes.
-     * More efficient than querying all blocks on every mutation.
-     */
-    function processPendingBlocks() {
-        if (!isEnabled || isProcessing) return;
-        isProcessing = true;
-
-        try {
-            pendingBlocks.forEach(block => {
-                // Verify block is still in DOM
-                if (!document.contains(block)) {
-                    pendingBlocks.delete(block);
-                    return;
-                }
-
-                // Apply custom font if configured
-                if (CONFIG.FONT_FAMILY) {
-                    block.style.fontFamily = CONFIG.FONT_FAMILY;
-                }
-
-                // For streaming content, we need to process new text nodes
-                // even if block was previously processed
-                processBlockIncremental(block);
-            });
-            pendingBlocks.clear();
-        } catch (e) {
-            console.error('[Bionic Reading] Error processing pending blocks:', e);
-        } finally {
-            isProcessing = false;
-        }
-    }
-
-    /**
-     * Incrementally process a block - only processes unprocessed text nodes.
-     * This allows re-processing streaming blocks without re-doing everything.
-     */
-    function processBlockIncremental(block) {
-        // Create TreeWalker to find all text nodes
-        const walker = document.createTreeWalker(
-            block,
-            NodeFilter.SHOW_TEXT,
-            {
-                acceptNode: function(node) {
-                    // Skip empty text nodes
-                    if (!node.nodeValue.trim()) return NodeFilter.FILTER_SKIP;
-                    // Skip if inside code block
-                    if (shouldSkipNode(node.parentNode)) return NodeFilter.FILTER_REJECT;
-                    // Skip if already inside our wrapper
-                    if (node.parentNode.classList && node.parentNode.classList.contains('bionic-text-wrapper')) {
-                        return NodeFilter.FILTER_REJECT;
-                    }
-                    return NodeFilter.FILTER_ACCEPT;
-                }
-            }
-        );
-
-        const textNodes = [];
-        let currentNode;
-        while (currentNode = walker.nextNode()) {
-            textNodes.push(currentNode);
-        }
-
-        // Process text nodes (TreeWalker already filtered, so minimal checks needed)
-        textNodes.forEach(node => {
-            const text = node.nodeValue;
-            const bionicHtml = transformText(text);
-
-            // Only touch DOM if transformation actually changed something
-            if (text !== bionicHtml) {
-                const span = document.createElement('span');
-                span.className = 'bionic-text-wrapper';
-                span.innerHTML = bionicHtml;
-                span.dataset.originalText = text;
-
-                node.parentNode.replaceChild(span, node);
-            }
-        });
-
-        // Mark as processed (for full revert tracking)
-        block.dataset.bionicProcessed = 'true';
-    }
-
     // -------------------------------------------------------------------------
-    // 5. CHAT COMMANDS (Mobile Support)
-    // -------------------------------------------------------------------------
-
-    function setupChatCommand() {
-        // We need to attach to the textarea. It might not exist immediately.
-        // We'll use a delegation approach or polling if needed, but delegation on body is safer for dynamic elements.
-        
-        document.body.addEventListener('keydown', (e) => {
-            // Only care about Enter key (without Shift)
-            if (e.key === 'Enter' && !e.shiftKey) {
-                const target = e.target;
-                
-                // Check if it's the chat input
-                if (target.tagName === 'TEXTAREA' && 
-                   (target.dataset.elementId === 'chat-input-textbox' || target.id === 'chat-input-textbox')) {
-                    
-                    const value = target.value.trim();
-                    
-                    // Check for magic command
-                    if (value.toLowerCase() === '/bionic') {
-                        // Prevent sending to AI
-                        e.preventDefault();
-                        e.stopPropagation();
-                        
-                        // Clear input
-                        target.value = '';
-                        
-                        // Trigger React/Framework change events so the UI knows it's empty
-                        // TypingMind uses React, so we need to hack the value setter if possible, 
-                        // or just simple clear might work if we trigger input event.
-                        const event = new Event('input', { bubbles: true });
-                        target.dispatchEvent(event);
-                        
-                        // Toggle feature
-                        toggleExtension();
-                    }
-                }
-            }
-        }, { capture: true }); // Capture phase to intercept before TypingMind handles it
-    }
-
-    // -------------------------------------------------------------------------
-    // 6. UI & NOTIFICATIONS
+    // 6. INITIALIZATION & EVENTS
     // -------------------------------------------------------------------------
 
     function showToast(message) {
-        // Remove existing toast
         const existing = document.getElementById('bionic-reading-toast');
         if (existing) existing.remove();
 
@@ -520,25 +406,22 @@
             padding: 12px 20px;
             border-radius: 8px;
             z-index: 99999;
-            font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            font-family: system-ui, -apple-system, sans-serif;
             font-size: 14px;
             font-weight: 500;
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
             border: 1px solid #374151;
             opacity: 0;
             transform: translateY(10px);
-            transition: opacity 0.3s ease, transform 0.3s ease;
+            transition: opacity 0.3s, transform 0.3s;
         `;
 
         document.body.appendChild(toast);
-
-        // Animate in
         requestAnimationFrame(() => {
             toast.style.opacity = '1';
             toast.style.transform = 'translateY(0)';
         });
 
-        // Remove after delay
         setTimeout(() => {
             toast.style.opacity = '0';
             toast.style.transform = 'translateY(10px)';
@@ -552,42 +435,53 @@
 
         if (isEnabled) {
             showToast('📖 Bionic Reading: ON');
-            runBionicProcessing();
+            injectStyles();
+            processExistingContent();
         } else {
             showToast('📖 Bionic Reading: OFF');
             revertAllProcessing();
-            removeCustomFont();
+            pendingNodes = []; // Clear pending queue
         }
     }
 
     function init() {
-        console.log('[Bionic Reading] Initializing...');
+        console.log('[Bionic Reading] Initializing v2.0 (Optimized)...');
 
-        // 1. Keyboard Shortcut
+        // Keyboard Shortcut
         document.addEventListener('keydown', (e) => {
-            // Check for Ctrl+Shift+B (or Cmd+Shift+B)
             if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'b' || e.key === 'B')) {
                 e.preventDefault();
                 toggleExtension();
             }
         });
 
-        // 2. Setup MutationObserver
+        // Start Observer
         setupObserver();
-        
-        // 3. Setup Chat Command (for Mobile)
-        setupChatCommand();
 
-        // 4. Initial Run (if enabled)
+        // Mobile Chat Command
+        document.body.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                const target = e.target;
+                if (target.tagName === 'TEXTAREA' && target.id === 'chat-input-textbox') {
+                    if (target.value.trim().toLowerCase() === '/bionic') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        target.value = '';
+                        target.dispatchEvent(new Event('input', { bubbles: true }));
+                        toggleExtension();
+                    }
+                }
+            }
+        }, { capture: true });
+
+        // Initial Run
         if (isEnabled) {
-            // Quick initial processing
-            setTimeout(runBionicProcessing, 100);
+            injectStyles();
+            // Small delay to let page load
+            setTimeout(processExistingContent, 500);
         }
-
-        console.log('[Bionic Reading] Ready. Use Ctrl+Shift+B or type "/bionic" to toggle.');
     }
 
-    // Start
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
